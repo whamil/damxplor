@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "svar-react": {
+      "source": "svar-widgets/skills",
+      "sourceType": "github",
+      "skillPath": "svar-react/SKILL.md",
+      "computedHash": "f5386157b42928b2833ee1d3d3e3c2aa50b00fdf4928c64534a7957a6a979421"
+    }
+  }
+}

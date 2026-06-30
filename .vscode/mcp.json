@@ -1,0 +1,9 @@
+{
+	"servers": {
+		"SVAR": {
+			"type": "http",
+			"url": "https://docs.svar.dev/mcp"
+		}
+	},
+	"inputs": []
+}
