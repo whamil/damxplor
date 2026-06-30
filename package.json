@@ -11,8 +11,11 @@
   },
   "dependencies": {
     "@mux/mux-player": "^3.13.0",
+    "@mux/mux-player-react": "^3.13.0",
     "@svar-ui/filemanager-data-provider": "^2.6.0",
     "@svar-ui/react-filemanager": "^2.6.0",
+    "googleapis": "^173.0.0",
+    "mux-embed": "^5.18.1",
     "react": "^19.1.0",
     "react-dom": "^19.1.0"
   },

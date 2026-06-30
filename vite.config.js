@@ -9,7 +9,11 @@ export default defineConfig({
       name: "nas-api",
       configureServer(server) {
         server.middlewares.use((request, response, next) => {
-          if (!request.url?.startsWith("/api/nas")) return next();
+          if (
+            !request.url?.startsWith("/api/nas")
+            && !request.url?.startsWith("/api/mux")
+            && !request.url?.startsWith("/api/google-drive")
+          ) return next();
           handleNasApi(request, response);
         });
       },

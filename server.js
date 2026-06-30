@@ -16,15 +16,22 @@ const contentTypes = {
 };
 
 const server = http.createServer(async (request, response) => {
-  if (request.url?.startsWith("/api/nas")) return handleNasApi(request, response);
+  if (
+    request.url?.startsWith("/api/nas")
+    || request.url?.startsWith("/api/mux")
+    || request.url?.startsWith("/api/google-drive")
+  ) return handleNasApi(request, response);
 
   try {
     const pathname = decodeURIComponent(new URL(request.url, "http://localhost").pathname);
     const requested = path.resolve(dist, `.${pathname}`);
-    const safePath = requested.startsWith(dist) ? requested : path.join(dist, "index.html");
+    const safePath = requested === dist || requested.startsWith(`${dist}${path.sep}`)
+      ? requested
+      : path.join(dist, "index.html");
     const stats = await fs.stat(safePath).catch(() => null);
     const file = stats?.isFile() ? safePath : path.join(dist, "index.html");
     response.writeHead(200, { "Content-Type": contentTypes[path.extname(file)] || "application/octet-stream" });
+    if (request.method === "HEAD") return response.end();
     createReadStream(file).pipe(response);
   } catch {
     response.writeHead(500);

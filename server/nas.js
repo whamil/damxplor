@@ -1,11 +1,21 @@
 import { createReadStream, createWriteStream, promises as fs } from "node:fs";
+import { spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import path from "node:path";
+import { loadEnvFile } from "node:process";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
+
+try {
+  loadEnvFile(path.resolve(".env"));
+} catch (error) {
+  if (error.code !== "ENOENT") throw error;
+}
 
 const configDirectory = path.resolve("data");
 const configFile = path.join(configDirectory, "nas-settings.json");
 const itemLimit = 5000;
+const googleOAuthStates = new Map();
 
 const defaultSettings = {
   path: "",
@@ -13,9 +23,25 @@ const defaultSettings = {
   includeHidden: false,
   maxDepth: 12,
   readonly: false,
+  activeMount: "google",
   clients: [],
   projects: [],
   labels: [],
+  muxAssets: [],
+  googleDrive: {
+    enabled: false,
+    clientId: "",
+    clientSecret: "",
+    refreshToken: "",
+    folderId: "",
+    folderName: "",
+    apiBaseUrl: "https://www.googleapis.com/drive/v3",
+    tokenUrl: "https://oauth2.googleapis.com/token",
+    redirectUri: "http://localhost:5174",
+    direction: "drive-to-nas",
+    autoSync: false,
+    intervalMinutes: 30,
+  },
 };
 
 function json(response, status, body) {
@@ -34,11 +60,30 @@ async function readBody(request) {
 
 export async function getSettings() {
   try {
-    return { ...defaultSettings, ...JSON.parse(await fs.readFile(configFile, "utf8")) };
+    const saved = JSON.parse(await fs.readFile(configFile, "utf8"));
+    return {
+      ...defaultSettings,
+      ...saved,
+      googleDrive: { ...defaultSettings.googleDrive, ...(saved.googleDrive || {}) },
+    };
   } catch (error) {
     if (error.code === "ENOENT") return defaultSettings;
     throw error;
   }
+}
+
+function publicSettings(settings) {
+  const googleDrive = settings.googleDrive || defaultSettings.googleDrive;
+  return {
+    ...settings,
+    googleDrive: {
+      ...googleDrive,
+      clientSecret: "",
+      refreshToken: "",
+      hasClientSecret: Boolean(googleDrive.clientSecret),
+      hasRefreshToken: Boolean(googleDrive.refreshToken),
+    },
+  };
 }
 
 async function validateSettings(input) {
@@ -62,20 +107,281 @@ async function validateSettings(input) {
     codes.add(client.code);
   }
 
+  const googleInput = input.googleDrive || {};
+  const googleDrive = {
+    enabled: Boolean(googleInput.enabled),
+    clientId: String(googleInput.clientId || "").trim(),
+    clientSecret: String(googleInput.clientSecret || "").trim(),
+    refreshToken: String(googleInput.refreshToken || "").trim(),
+    folderId: String(googleInput.folderId || "").trim(),
+    folderName: String(googleInput.folderName || "").trim(),
+    apiBaseUrl: String(googleInput.apiBaseUrl || defaultSettings.googleDrive.apiBaseUrl).replace(/\/$/, ""),
+    tokenUrl: String(googleInput.tokenUrl || defaultSettings.googleDrive.tokenUrl),
+    redirectUri: String(googleInput.redirectUri || defaultSettings.googleDrive.redirectUri).replace(/\/$/, ""),
+    direction: ["drive-to-nas", "nas-to-drive", "two-way"].includes(googleInput.direction)
+      ? googleInput.direction
+      : "drive-to-nas",
+    autoSync: Boolean(googleInput.autoSync),
+    intervalMinutes: Math.min(1440, Math.max(5, Number(googleInput.intervalMinutes) || 30)),
+  };
+  if (googleDrive.enabled && (!googleDrive.clientId || !googleDrive.clientSecret || !googleDrive.refreshToken)) {
+    throw new Error("Google Drive sync requires Client ID, Client Secret, and Refresh Token");
+  }
+
   return {
     path: resolvedPath,
     displayName: String(input.displayName || path.basename(resolvedPath) || "NAS").trim(),
     includeHidden: Boolean(input.includeHidden),
     maxDepth: Math.min(30, Math.max(1, Number(input.maxDepth) || 12)),
     readonly: Boolean(input.readonly),
+    activeMount: input.activeMount === "google" && googleDrive.folderId ? "google" : "nas",
     clients,
     projects: Array.isArray(input.projects) ? input.projects : [],
     labels: Array.isArray(input.labels) ? input.labels : [],
+    muxAssets: Array.isArray(input.muxAssets) ? input.muxAssets : [],
+    googleDrive,
   };
 }
 
+async function googleDriveAccess(settingsInput) {
+  const saved = await getSettings();
+  const google = {
+    ...(saved.googleDrive || {}),
+    ...(settingsInput.googleDrive || {}),
+    clientSecret: settingsInput.googleDrive?.clientSecret || saved.googleDrive?.clientSecret || "",
+    refreshToken: settingsInput.googleDrive?.refreshToken || saved.googleDrive?.refreshToken || "",
+  };
+  if (!google.clientId || !google.clientSecret || !google.refreshToken) {
+    throw new Error("Enter the Google OAuth Client ID, Client Secret, and Refresh Token first");
+  }
+  if (!google.clientId.endsWith(".apps.googleusercontent.com")) {
+    throw new Error("The Google OAuth Client ID must end with .apps.googleusercontent.com");
+  }
+  if (!/^1\/\/?/.test(google.refreshToken)) {
+    throw new Error("The Refresh Token is not a Google OAuth refresh token. Generate an offline-access token; do not enter an API key or authorization code.");
+  }
+  const tokenResponse = await fetch(google.tokenUrl || defaultSettings.googleDrive.tokenUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      client_id: google.clientId,
+      client_secret: google.clientSecret,
+      refresh_token: google.refreshToken,
+      grant_type: "refresh_token",
+    }),
+  });
+  const token = await tokenResponse.json();
+  if (!tokenResponse.ok || !token.access_token) {
+    const message = token.error === "invalid_client"
+      ? "Google rejected the OAuth Client ID or Client Secret. Confirm both values belong to the same OAuth client."
+      : token.error === "invalid_grant"
+        ? "Google rejected the Refresh Token. Generate a new offline-access refresh token for this OAuth client."
+        : token.error_description || token.error || "Google OAuth authentication failed";
+    const error = new Error(message);
+    error.status = 401;
+    throw error;
+  }
+  return { google, accessToken: token.access_token };
+}
+
+async function testGoogleDrive(settingsInput) {
+  const { google, accessToken } = await googleDriveAccess(settingsInput);
+  const apiBase = String(google.apiBaseUrl || defaultSettings.googleDrive.apiBaseUrl).replace(/\/$/, "");
+  const endpoint = google.folderId
+    ? `${apiBase}/files/${encodeURIComponent(google.folderId)}?fields=id,name,mimeType,modifiedTime&supportsAllDrives=true`
+    : `${apiBase}/about?fields=user,storageQuota`;
+  const driveResponse = await fetch(endpoint, { headers: { Authorization: `Bearer ${accessToken}` } });
+  const result = await driveResponse.json();
+  if (!driveResponse.ok) {
+    const message = driveResponse.status === 404 && google.folderId
+      ? "Google Drive cannot access that Folder ID. Re-authorize full Drive access, then confirm the folder still exists and is shared with this Google account."
+      : result.error?.message || "Google Drive API connection failed";
+    throw new Error(message);
+  }
+  return {
+    connected: true,
+    target: google.folderId ? { id: result.id, name: result.name, mimeType: result.mimeType } : null,
+    user: result.user?.displayName || result.user?.emailAddress || null,
+  };
+}
+
+async function listGoogleDriveFolders(input) {
+  const { google, accessToken } = await googleDriveAccess(input);
+  const apiBase = String(google.apiBaseUrl || defaultSettings.googleDrive.apiBaseUrl).replace(/\/$/, "");
+  const parentId = String(input.parentId || "root");
+  let current = { id: "root", name: "My Drive", parentId: null };
+  if (parentId !== "root") {
+    const currentResponse = await fetch(
+      `${apiBase}/files/${encodeURIComponent(parentId)}?fields=id,name,parents&supportsAllDrives=true`,
+      { headers: { Authorization: `Bearer ${accessToken}` } },
+    );
+    const currentData = await currentResponse.json();
+    if (!currentResponse.ok) throw new Error(currentData.error?.message || "Unable to open this Google Drive folder");
+    current = { id: currentData.id, name: currentData.name, parentId: currentData.parents?.[0] || "root" };
+  }
+  const query = new URLSearchParams({
+    q: `'${parentId.replaceAll("'", "\\'")}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`,
+    fields: "files(id,name,modifiedTime,driveId)",
+    orderBy: "name",
+    pageSize: "1000",
+    supportsAllDrives: "true",
+    includeItemsFromAllDrives: "true",
+  });
+  const response = await fetch(`${apiBase}/files?${query}`, { headers: { Authorization: `Bearer ${accessToken}` } });
+  const result = await response.json();
+  if (!response.ok) throw new Error(result.error?.message || "Unable to list Google Drive folders");
+  return { current, folders: result.files || [] };
+}
+
+function safeDriveName(name) {
+  return String(name || "Untitled").replaceAll("/", "-").replaceAll("\\", "-");
+}
+
+async function loadGoogleFilemanager(input) {
+  const settings = await getSettings();
+  const google = { ...settings.googleDrive, ...(input.googleDrive || {}) };
+  const driveId = String(input.driveId || google.folderId || "root");
+  const rootName = safeDriveName(google.folderName || "Google Drive");
+  if (!input.parentPath) {
+    return [{ id: `/${rootName}`, type: "folder", lazy: true, open: false, driveId, source: "google" }];
+  }
+  const { accessToken } = await googleDriveAccess({ googleDrive: google });
+  const apiBase = String(google.apiBaseUrl || defaultSettings.googleDrive.apiBaseUrl).replace(/\/$/, "");
+  const query = new URLSearchParams({
+    q: `'${driveId.replaceAll("'", "\\'")}' in parents and trashed=false`,
+    fields: "files(id,name,mimeType,size,modifiedTime,driveId)",
+    orderBy: "folder,name",
+    pageSize: "1000",
+    supportsAllDrives: "true",
+    includeItemsFromAllDrives: "true",
+  });
+  const response = await fetch(`${apiBase}/files?${query}`, { headers: { Authorization: `Bearer ${accessToken}` } });
+  const result = await response.json();
+  if (!response.ok) throw new Error(result.error?.message || "Unable to load Google Drive files");
+  const usedNames = new Set();
+  return (result.files || []).map((file) => {
+    let name = safeDriveName(file.name);
+    if (usedNames.has(name.toLowerCase())) name = `${name} (${file.id.slice(-6)})`;
+    usedNames.add(name.toLowerCase());
+    const folder = file.mimeType === "application/vnd.google-apps.folder";
+    return {
+      id: `${input.parentPath}/${name}`,
+      type: folder ? "folder" : "file",
+      lazy: folder,
+      open: false,
+      size: Number(file.size) || 0,
+      date: file.modifiedTime,
+      driveId: file.id,
+      mimeType: file.mimeType,
+      source: "google",
+    };
+  });
+}
+
+function requestOrigin(request) {
+  const forwardedProto = String(request.headers["x-forwarded-proto"] || "").split(",")[0].trim();
+  const protocol = forwardedProto || (request.socket?.encrypted ? "https" : "http");
+  const host = request.headers.host;
+  if (!host) throw new Error("Unable to determine the OAuth redirect origin");
+  return `${protocol}://${host}`;
+}
+
+async function createGoogleAuthorization(request, input) {
+  const saved = await getSettings();
+  const provided = input.googleDrive || {};
+  const google = {
+    ...(saved.googleDrive || {}),
+    ...provided,
+    clientSecret: provided.clientSecret || saved.googleDrive?.clientSecret || "",
+  };
+  if (!google.clientId || !google.clientSecret) {
+    throw new Error("Enter the Google OAuth Client ID and Client Secret first");
+  }
+  const redirectUri = String(google.redirectUri || requestOrigin(request)).replace(/\/$/, "");
+  let redirectUrl;
+  try {
+    redirectUrl = new URL(redirectUri);
+  } catch {
+    throw new Error("Enter a valid Google OAuth redirect URI");
+  }
+  if (!['http:', 'https:'].includes(redirectUrl.protocol) || redirectUrl.search || redirectUrl.hash) {
+    throw new Error("The Google OAuth redirect URI must be an HTTP(S) origin without a query or fragment");
+  }
+  const state = randomBytes(32).toString("hex");
+  googleOAuthStates.set(state, {
+    createdAt: Date.now(),
+    redirectUri,
+    clientId: google.clientId,
+    clientSecret: google.clientSecret,
+    tokenUrl: google.tokenUrl || defaultSettings.googleDrive.tokenUrl,
+    google,
+  });
+  for (const [key, value] of googleOAuthStates) {
+    if (Date.now() - value.createdAt > 10 * 60 * 1000) googleOAuthStates.delete(key);
+  }
+  const query = new URLSearchParams({
+    client_id: google.clientId,
+    redirect_uri: redirectUri,
+    response_type: "code",
+    access_type: "offline",
+    prompt: "consent",
+    include_granted_scopes: "true",
+    scope: "https://www.googleapis.com/auth/drive",
+    state,
+  });
+  return { authUrl: `https://accounts.google.com/o/oauth2/v2/auth?${query}`, redirectUri };
+}
+
+async function completeGoogleAuthorization(input) {
+  const pending = googleOAuthStates.get(String(input.state || ""));
+  googleOAuthStates.delete(String(input.state || ""));
+  if (!pending || Date.now() - pending.createdAt > 10 * 60 * 1000) {
+    throw new Error("Google authorization expired. Start authorization again.");
+  }
+  if (!input.code) throw new Error("Google did not return an authorization code");
+  const tokenResponse = await fetch(pending.tokenUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      code: input.code,
+      client_id: pending.clientId,
+      client_secret: pending.clientSecret,
+      redirect_uri: pending.redirectUri,
+      grant_type: "authorization_code",
+    }),
+  });
+  const token = await tokenResponse.json();
+  if (!tokenResponse.ok) {
+    const error = new Error(token.error_description || token.error || "Unable to exchange the Google authorization code");
+    error.status = 401;
+    throw error;
+  }
+  if (!token.refresh_token) {
+    throw new Error("Google did not return a refresh token. Revoke the app's access, then authorize again with consent.");
+  }
+  const saved = await getSettings();
+  const settings = await saveSettings({
+    ...saved,
+    googleDrive: {
+      ...saved.googleDrive,
+      ...pending.google,
+      enabled: true,
+      refreshToken: token.refresh_token,
+    },
+  });
+  return { connected: true, settings: publicSettings(settings) };
+}
+
 export async function saveSettings(input) {
-  const settings = await validateSettings(input);
+  const current = await getSettings();
+  const settings = await validateSettings({
+    ...input,
+    googleDrive: {
+      ...(input.googleDrive || {}),
+      clientSecret: input.googleDrive?.clientSecret || current.googleDrive?.clientSecret || "",
+      refreshToken: input.googleDrive?.refreshToken || current.googleDrive?.refreshToken || "",
+    },
+  });
   await fs.mkdir(configDirectory, { recursive: true });
   await fs.writeFile(configFile, `${JSON.stringify(settings, null, 2)}\n`, "utf8");
   return settings;
@@ -113,6 +419,7 @@ export async function scanNas(settings) {
             id,
             type: "folder",
             date: stats.mtime,
+            open: false,
             ...(project ? { tag: project.tag, clientCode: project.code, clientName: project.clientName } : {}),
             ...(label ? { label: label.name, labelColor: label.color } : {}),
           });
@@ -134,7 +441,7 @@ export async function scanNas(settings) {
   }
 
   await walk(valid.path, "", 0);
-  return { files, truncated: files.length >= itemLimit, settings: valid };
+  return { files, truncated: files.length >= itemLimit, settings: publicSettings(valid) };
 }
 
 async function getDriveInfo(settings) {
@@ -142,6 +449,58 @@ async function getDriveInfo(settings) {
   const total = Number(stats.bsize) * Number(stats.blocks);
   const available = Number(stats.bsize) * Number(stats.bavail);
   return { used: Math.max(0, total - available), total };
+}
+
+function formatByteSize(bytes) {
+  if (!bytes) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  const unit = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+  return `${(bytes / 1024 ** unit).toFixed(unit ? 1 : 0)} ${units[unit]}`;
+}
+
+async function getItemInfo(id) {
+  const settings = await validateSettings(await getSettings());
+  const itemPath = idToNasPath(id, settings);
+  const stats = await fs.stat(itemPath);
+  const project = settings.projects.find((entry) => entry.path === itemPath);
+  const label = settings.labels.find((entry) => entry.path === itemPath);
+  const relativePath = path.relative(settings.path, itemPath).split(path.sep).join("/") || "/";
+  let count = 0;
+  let totalSize = stats.isFile() ? stats.size : 0;
+  let truncated = false;
+
+  if (stats.isDirectory()) {
+    const pending = [itemPath];
+    while (pending.length && count < itemLimit) {
+      const folder = pending.pop();
+      const entries = await fs.readdir(folder, { withFileTypes: true });
+      for (const entry of entries) {
+        if (!settings.includeHidden && entry.name.startsWith(".")) continue;
+        if (entry.isSymbolicLink()) continue;
+        const child = path.join(folder, entry.name);
+        try {
+          const childStats = await fs.stat(child);
+          count += 1;
+          if (childStats.isDirectory()) pending.push(child);
+          else if (childStats.isFile()) totalSize += childStats.size;
+          if (count >= itemLimit) {
+            truncated = true;
+            break;
+          }
+        } catch (error) {
+          if (!["EACCES", "EPERM", "ENOENT"].includes(error.code)) throw error;
+        }
+      }
+    }
+  }
+
+  return {
+    Size: formatByteSize(totalSize),
+    Count: stats.isDirectory() ? `${count}${truncated ? "+" : ""} items` : "1 file",
+    "NAS Path": `/${relativePath}`,
+    ...(project ? { Client: `${project.clientName} (${project.code})`, "Client Tag": project.tag } : {}),
+    ...(label ? { Label: label.name, "Label Color": label.color } : {}),
+  };
 }
 
 async function listFolder(settings, folderId) {
@@ -169,6 +528,7 @@ async function listFolder(settings, folderId) {
           type: "folder",
           date: stats.mtime,
           lazy: true,
+          open: false,
           ...(project ? { tag: project.tag, clientCode: project.code, clientName: project.clientName } : {}),
           ...(label ? { label: label.name, labelColor: label.color } : {}),
         });
@@ -195,7 +555,7 @@ export async function loadNasData(folderId = "") {
   if (!folderId) {
     const rootName = settings.displayName.replaceAll("/", "-") || "NAS";
     const rootStats = await fs.stat(settings.path);
-    files.unshift({ id: `/${rootName}`, type: "folder", date: rootStats.mtime });
+    files.unshift({ id: `/${rootName}`, type: "folder", date: rootStats.mtime, open: false });
   }
   return { files, drive: await getDriveInfo(settings), settings };
 }
@@ -257,6 +617,62 @@ function cleanFolderName(value, label) {
   return name;
 }
 
+function escapeDriveQuery(value) {
+  return String(value).replaceAll("\\", "\\\\").replaceAll("'", "\\'");
+}
+
+async function ensureGoogleFolder(apiBase, accessToken, parentId, name) {
+  const query = new URLSearchParams({
+    q: `'${escapeDriveQuery(parentId)}' in parents and name='${escapeDriveQuery(name)}' and mimeType='application/vnd.google-apps.folder' and trashed=false`,
+    fields: "files(id,name)",
+    pageSize: "1",
+    supportsAllDrives: "true",
+    includeItemsFromAllDrives: "true",
+  });
+  const lookup = await fetch(`${apiBase}/files?${query}`, { headers: { Authorization: `Bearer ${accessToken}` } });
+  const found = await lookup.json();
+  if (!lookup.ok) throw new Error(found.error?.message || `Unable to find Google Drive folder ${name}`);
+  if (found.files?.[0]) return found.files[0];
+  const created = await fetch(`${apiBase}/files?supportsAllDrives=true&fields=id,name`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ name, mimeType: "application/vnd.google-apps.folder", parents: [parentId] }),
+  });
+  const folder = await created.json();
+  if (!created.ok) throw new Error(folder.error?.message || `Unable to create Google Drive folder ${name}`);
+  return folder;
+}
+
+async function createGoogleProjectFolders(settings, folderName, year, folders) {
+  if (!settings.googleDrive.folderId) throw new Error("Choose a mounted Google Drive folder first");
+  const { google, accessToken } = await googleDriveAccess({ googleDrive: settings.googleDrive });
+  const apiBase = String(google.apiBaseUrl || defaultSettings.googleDrive.apiBaseUrl).replace(/\/$/, "");
+  const archive = await ensureGoogleFolder(apiBase, accessToken, google.folderId, "00 Project Archive");
+  const yearFolder = await ensureGoogleFolder(apiBase, accessToken, archive.id, year);
+  const project = await ensureGoogleFolder(apiBase, accessToken, yearFolder.id, folderName);
+  const cache = new Map([["", project.id]]);
+  for (const relativeFolder of folders) {
+    const parts = relativeFolder.split("/");
+    let relative = "";
+    let parentId = project.id;
+    for (const part of parts) {
+      relative = relative ? `${relative}/${part}` : part;
+      if (!cache.has(relative)) {
+        const created = await ensureGoogleFolder(apiBase, accessToken, parentId, part);
+        cache.set(relative, created.id);
+      }
+      parentId = cache.get(relative);
+    }
+  }
+  return {
+    files: await loadGoogleFilemanager({ googleDrive: settings.googleDrive }),
+    settings: publicSettings(settings),
+    createdPath: `${google.folderName || "Google Drive"}/00 Project Archive/${year}/${folderName}`,
+    createdCount: folders.length,
+    mount: "google",
+  };
+}
+
 export async function createProjectFolders(input) {
   const settings = await validateSettings(await getSettings());
   if (settings.readonly) throw new Error("NAS is in read-only mode");
@@ -273,6 +689,10 @@ export async function createProjectFolders(input) {
     ...projectFolders,
     `02 Photo Coverage/${client.name} - ${eventName}`,
   ];
+
+  if (settings.activeMount === "google") {
+    return await createGoogleProjectFolders(settings, folderName, year, folders);
+  }
 
   await Promise.all(folders.map((folder) => fs.mkdir(path.join(projectRoot, folder), { recursive: true })));
   const projects = [
@@ -324,6 +744,7 @@ export async function performFileAction(input) {
   const action = input.action;
   let projects = [...settings.projects];
   let labels = [...settings.labels];
+  let muxAssets = [...settings.muxAssets];
 
   if (action === "create-file") {
     const target = idToNasPath(input.newId, settings);
@@ -344,6 +765,7 @@ export async function performFileAction(input) {
       path: replacePathPrefix(project.path, source, target),
     }));
     labels = labels.map((label) => ({ ...label, path: replacePathPrefix(label.path, source, target) }));
+    muxAssets = muxAssets.map((asset) => ({ ...asset, path: replacePathPrefix(asset.path, source, target) }));
   } else if (action === "move-files" || action === "copy-files") {
     if (!Array.isArray(input.ids) || input.ids.length !== input.newIds?.length) {
       throw new Error("The source and generated ID lists do not match");
@@ -360,6 +782,7 @@ export async function performFileAction(input) {
           path: replacePathPrefix(project.path, source, target),
         }));
         labels = labels.map((label) => ({ ...label, path: replacePathPrefix(label.path, source, target) }));
+        muxAssets = muxAssets.map((asset) => ({ ...asset, path: replacePathPrefix(asset.path, source, target) }));
       } else {
         await fs.cp(source, target, { recursive: true, errorOnExist: true });
         const copiedProjects = projects
@@ -370,6 +793,10 @@ export async function performFileAction(input) {
           .filter((label) => label.path === source || label.path.startsWith(`${source}${path.sep}`))
           .map((label) => ({ ...label, path: replacePathPrefix(label.path, source, target) }));
         labels.push(...copiedLabels);
+        const copiedMuxAssets = muxAssets
+          .filter((asset) => asset.path === source || asset.path.startsWith(`${source}${path.sep}`))
+          .map((asset) => ({ ...asset, path: replacePathPrefix(asset.path, source, target) }));
+        muxAssets.push(...copiedMuxAssets);
       }
     }
   } else if (action === "delete-files") {
@@ -382,13 +809,17 @@ export async function performFileAction(input) {
     labels = labels.filter((label) => !targets.some(
       (target) => label.path === target || label.path.startsWith(`${target}${path.sep}`),
     ));
+    muxAssets = muxAssets.filter((asset) => !targets.some(
+      (target) => asset.path === target || asset.path.startsWith(`${target}${path.sep}`),
+    ));
   } else {
     throw new Error(`Unsupported file action: ${action}`);
   }
 
   if (JSON.stringify(projects) !== JSON.stringify(settings.projects)
-    || JSON.stringify(labels) !== JSON.stringify(settings.labels)) {
-    await fs.writeFile(configFile, `${JSON.stringify({ ...settings, projects, labels }, null, 2)}\n`, "utf8");
+    || JSON.stringify(labels) !== JSON.stringify(settings.labels)
+    || JSON.stringify(muxAssets) !== JSON.stringify(settings.muxAssets)) {
+    await fs.writeFile(configFile, `${JSON.stringify({ ...settings, projects, labels, muxAssets }, null, 2)}\n`, "utf8");
   }
   return { newId: input.newId, newIds: input.newIds };
 }
@@ -406,6 +837,139 @@ async function applyLabels(input) {
   ];
   await fs.writeFile(configFile, `${JSON.stringify({ ...settings, labels }, null, 2)}\n`, "utf8");
   return { labels: selectedPaths.map((itemPath) => ({ path: itemPath, name, color })) };
+}
+
+const videoExtensions = new Set([".avi", ".m4v", ".mkv", ".mov", ".mp4", ".mpeg", ".mpg", ".webm"]);
+
+function muxCredentials() {
+  const tokenId = process.env.MUX_TOKEN_ID;
+  const tokenSecret = process.env.MUX_TOKEN_SECRET;
+  return tokenId && tokenSecret ? { tokenId, tokenSecret } : null;
+}
+
+async function muxRequest(endpoint, options = {}) {
+  const credentials = muxCredentials();
+  if (!credentials) throw new Error("Mux credentials are not configured on the server");
+  const response = await fetch(`https://api.mux.com/video/v1${endpoint}`, {
+    ...options,
+    headers: {
+      Authorization: `Basic ${Buffer.from(`${credentials.tokenId}:${credentials.tokenSecret}`).toString("base64")}`,
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+  const result = await response.json();
+  if (!response.ok) throw new Error(result.error?.message || `Mux API returned ${response.status}`);
+  return result.data;
+}
+
+async function writeMuxRecord(record) {
+  const settings = await getSettings();
+  const muxAssets = [
+    ...(settings.muxAssets || []).filter((item) => item.path !== record.path),
+    record,
+  ];
+  await fs.mkdir(configDirectory, { recursive: true });
+  await fs.writeFile(configFile, `${JSON.stringify({ ...settings, muxAssets }, null, 2)}\n`, "utf8");
+  return record;
+}
+
+async function startMuxUpload(id) {
+  const settings = await validateSettings(await getSettings());
+  if (settings.readonly) throw new Error("NAS is in read-only mode");
+  if (!muxCredentials()) throw new Error("Set MUX_TOKEN_ID and MUX_TOKEN_SECRET on the server first");
+  const filePath = idToNasPath(id, settings);
+  const stats = await fs.stat(filePath);
+  if (!stats.isFile() || !videoExtensions.has(path.extname(filePath).toLowerCase())) {
+    throw new Error("Select a supported video file");
+  }
+
+  const existing = settings.muxAssets.find((item) => item.path === filePath);
+  if (existing && !["error", "timed_out", "cancelled"].includes(existing.status)) return existing;
+
+  const upload = await muxRequest("/uploads", {
+    method: "POST",
+    body: JSON.stringify({
+      cors_origin: "*",
+      timeout: 86400,
+      new_asset_settings: {
+        passthrough: id,
+        playback_policies: ["public"],
+        video_quality: "basic",
+      },
+    }),
+  });
+  const record = await writeMuxRecord({
+    path: filePath,
+    fileId: id,
+    uploadId: upload.id,
+    assetId: null,
+    playbackId: null,
+    status: "uploading",
+    error: null,
+    createdAt: new Date().toISOString(),
+  });
+
+  const uploader = spawn("curl", [
+    "--fail",
+    "--silent",
+    "--show-error",
+    "--request", "PUT",
+    "--upload-file", filePath,
+    upload.url,
+  ], { stdio: ["ignore", "ignore", "pipe"] });
+  let uploadError = "";
+  uploader.stderr.on("data", (chunk) => { uploadError += chunk.toString(); });
+  uploader.on("error", (error) => { uploadError = error.message; });
+  uploader.on("close", async (code) => {
+    try {
+      const current = (await getSettings()).muxAssets?.find((item) => item.path === filePath) || record;
+      await writeMuxRecord({
+        ...current,
+        status: code === 0 ? "processing" : "error",
+        error: code === 0 ? null : uploadError.trim() || `Upload exited with code ${code}`,
+      });
+    } catch (error) {
+      console.error("Unable to persist Mux upload result", error);
+    }
+  });
+
+  return record;
+}
+
+async function getMuxStatus(id) {
+  const settings = await validateSettings(await getSettings());
+  const filePath = idToNasPath(id, settings);
+  let record = settings.muxAssets.find((item) => item.path === filePath);
+  if (!record) return { configured: Boolean(muxCredentials()), status: "not_uploaded", fileId: id };
+  if (!muxCredentials()) return { configured: false, ...record };
+
+  try {
+    if (!record.assetId && record.uploadId) {
+      const upload = await muxRequest(`/uploads/${encodeURIComponent(record.uploadId)}`);
+      record = {
+        ...record,
+        status: upload.status === "asset_created" ? "processing" : upload.status,
+        assetId: upload.asset_id || record.assetId,
+        error: upload.error?.message || record.error,
+      };
+    }
+    if (record.assetId) {
+      const asset = await muxRequest(`/assets/${encodeURIComponent(record.assetId)}`);
+      record = {
+        ...record,
+        status: asset.status,
+        playbackId: asset.playback_ids?.[0]?.id || record.playbackId,
+        error: asset.errors?.messages?.join(" ") || record.error,
+        duration: asset.duration,
+        aspectRatio: asset.aspect_ratio,
+      };
+    }
+    await writeMuxRecord(record);
+  } catch (error) {
+    record = { ...record, error: error.message };
+  }
+  return { configured: true, ...record };
 }
 
 async function uploadFile(request, id) {
@@ -458,6 +1022,9 @@ async function serveDirectFile(request, response, id, download) {
     "Last-Modified": stats.mtime.toUTCString(),
     "X-Content-Type-Options": "nosniff",
   };
+  if ([".html", ".htm", ".svg"].includes(path.extname(filePath).toLowerCase())) {
+    headers["Content-Security-Policy"] = "sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data:";
+  }
 
   let start = 0;
   let end = stats.size - 1;
@@ -598,13 +1165,37 @@ export async function handleNasApi(request, response) {
       );
     }
 
+    if (request.method === "GET" && url.pathname === "/api/nas/item-info") {
+      return json(response, 200, await getItemInfo(url.searchParams.get("id")));
+    }
+
     if (request.method === "GET" && url.pathname === "/api/nas/settings") {
-      return json(response, 200, await getSettings());
+      return json(response, 200, publicSettings(await getSettings()));
     }
 
     if (request.method === "POST" && url.pathname === "/api/nas/settings") {
       const settings = await saveSettings(await readBody(request));
       return json(response, 200, await scanNas(settings));
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/google-drive/test") {
+      return json(response, 200, await testGoogleDrive(await readBody(request)));
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/google-drive/auth-url") {
+      return json(response, 200, await createGoogleAuthorization(request, await readBody(request)));
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/google-drive/oauth-callback") {
+      return json(response, 200, await completeGoogleAuthorization(await readBody(request)));
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/google-drive/folders") {
+      return json(response, 200, await listGoogleDriveFolders(await readBody(request)));
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/google-drive/filemanager") {
+      return json(response, 200, await loadGoogleFilemanager(await readBody(request)));
     }
 
     if (request.method === "GET" && url.pathname === "/api/nas/files") {
@@ -636,9 +1227,18 @@ export async function handleNasApi(request, response) {
       return json(response, 200, await applyLabels(await readBody(request)));
     }
 
+    if (request.method === "POST" && url.pathname === "/api/mux/upload") {
+      const body = await readBody(request);
+      return json(response, 202, await startMuxUpload(body.id));
+    }
+
+    if (request.method === "GET" && url.pathname === "/api/mux/status") {
+      return json(response, 200, await getMuxStatus(url.searchParams.get("id")));
+    }
+
     return json(response, 404, { error: "Not found" });
   } catch (error) {
-    const status = ["EACCES", "EPERM"].includes(error.code) ? 403 : 400;
+    const status = error.status || (["EACCES", "EPERM"].includes(error.code) ? 403 : 400);
     return json(response, status, { error: error.message || "Unable to access NAS path" });
   }
 }

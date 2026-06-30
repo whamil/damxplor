@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { RestDataProvider } from "@svar-ui/filemanager-data-provider";
 import {
   Filemanager,
@@ -13,6 +13,7 @@ import { getData } from "./common/data";
 
 const restProvider = new RestDataProvider("/api/nas/rest");
 const providerListenerTag = {};
+const MuxPlayer = lazy(() => import("@mux/mux-player-react/lazy"));
 
 const modes = [
   { id: "cards", label: "Cards", icon: "▦" },
@@ -36,6 +37,29 @@ function formatBytes(bytes = 0) {
   const units = ["B", "KB", "MB", "GB"];
   const unit = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
   return `${(bytes / 1024 ** unit).toFixed(unit ? 1 : 0)} ${units[unit]}`;
+}
+
+function formatDuration(seconds) {
+  if (!Number.isFinite(Number(seconds))) return "—";
+  const total = Math.max(0, Math.round(Number(seconds)));
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const remaining = total % 60;
+  return hours
+    ? `${hours}:${String(minutes).padStart(2, "0")}:${String(remaining).padStart(2, "0")}`
+    : `${minutes}:${String(remaining).padStart(2, "0")}`;
+}
+
+async function readJsonResponse(response) {
+  const body = await response.text();
+  if (!body.trim()) {
+    throw new Error(`Server returned an empty response (${response.status} ${response.statusText || "Unknown status"})`);
+  }
+  try {
+    return JSON.parse(body);
+  } catch {
+    throw new Error(`Server returned an invalid response (${response.status} ${response.statusText || "Unknown status"})`);
+  }
 }
 
 function FileTooltip({ data }) {
@@ -63,6 +87,13 @@ function createIconSvg(symbol, color, background) {
 
 const designIcon = createIconSvg("✦", "#7c3aed", "#ede9fe");
 const imageIcon = createIconSvg("◉", "#0284c7", "#e0f2fe");
+const previewExtensions = new Set(["avif", "gif", "jpeg", "jpg", "png", "svg", "webp"]);
+const videoExtensions = new Set(["avi", "m4v", "mkv", "mov", "mp4", "mpeg", "mpg", "webm"]);
+
+function filePreview(file) {
+  if (file.type !== "file" || !previewExtensions.has(file.ext)) return null;
+  return `/api/nas/direct?id=${encodeURIComponent(file.id)}`;
+}
 
 function customIcons(file, size) {
   if (file.labelColor) return createIconSvg("●", file.labelColor, `${file.labelColor}22`);
@@ -81,6 +112,7 @@ function customIcons(file, size) {
 export default function App() {
   const managerRef = useRef(null);
   const uploadInputRef = useRef(null);
+  const googleOAuthHandledRef = useRef(false);
   const [data, setData] = useState(getData);
   const [drive, setDrive] = useState({ used: 0, total: 0 });
   const [api, setApi] = useState(null);
@@ -91,9 +123,16 @@ export default function App() {
   const [theme, setTheme] = useState("willow");
   const [serialized, setSerialized] = useState(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsTab, setSettingsTab] = useState("nas");
   const [connected, setConnected] = useState(false);
   const [settingsBusy, setSettingsBusy] = useState(false);
   const [settingsError, setSettingsError] = useState("");
+  const [googleTestBusy, setGoogleTestBusy] = useState(false);
+  const [googleAuthBusy, setGoogleAuthBusy] = useState(false);
+  const [googleTestResult, setGoogleTestResult] = useState(null);
+  const [googleFolderBrowser, setGoogleFolderBrowser] = useState(null);
+  const [googleFolderBusy, setGoogleFolderBusy] = useState(false);
+  const [googleFolderError, setGoogleFolderError] = useState("");
   const [folderBrowser, setFolderBrowser] = useState(null);
   const [folderBrowserBusy, setFolderBrowserBusy] = useState(false);
   const [folderBrowserError, setFolderBrowserError] = useState("");
@@ -103,9 +142,11 @@ export default function App() {
   const [projectCreated, setProjectCreated] = useState("");
   const [syncNotice, setSyncNotice] = useState(null);
   const [selection, setSelection] = useState([]);
+  const [selectedVideo, setSelectedVideo] = useState(null);
   const [labelDialogOpen, setLabelDialogOpen] = useState(false);
   const [labelBusy, setLabelBusy] = useState(false);
   const [labelForm, setLabelForm] = useState({ name: "Review", color: "#F59E0B" });
+  const [muxVideo, setMuxVideo] = useState(null);
   const [project, setProject] = useState({
     date: new Date().toISOString().slice(0, 10),
     eventName: "",
@@ -117,8 +158,23 @@ export default function App() {
     includeHidden: false,
     maxDepth: 12,
     readonly: false,
+    activeMount: "google",
     clients: [],
     projects: [],
+    googleDrive: {
+      enabled: false,
+      clientId: "",
+      clientSecret: "",
+      refreshToken: "",
+      folderId: "",
+      folderName: "",
+      apiBaseUrl: "https://www.googleapis.com/drive/v3",
+      tokenUrl: "https://oauth2.googleapis.com/token",
+      redirectUri: "http://localhost:5174",
+      direction: "drive-to-nas",
+      autoSync: false,
+      intervalMinutes: 30,
+    },
   });
 
   const panels = useMemo(() => {
@@ -139,20 +195,58 @@ export default function App() {
       restProvider.loadInfo(),
     ]);
     if (!Array.isArray(files)) throw new Error("Unable to load files from the NAS server");
-    setData(files);
+    setData(files.map((item) => ({
+      ...item,
+      date: item.date ? new Date(item.date) : undefined,
+    })));
     setDrive(info?.stats || { used: 0, total: 0 });
     setConnected(true);
     return { files, drive: info?.stats };
   }, []);
 
+  const loadGoogleMount = useCallback(async (config) => {
+    const response = await fetch("/api/google-drive/filemanager", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ googleDrive: config.googleDrive }),
+    });
+    const files = await readJsonResponse(response);
+    if (!response.ok) throw new Error(files.error || "Unable to load Google Drive mount");
+    setData(files.map((item) => ({ ...item, date: item.date ? new Date(item.date) : new Date() })));
+    setDrive({ used: 0, total: 0 });
+    setConnected(true);
+    return files;
+  }, []);
+
   const loadDynamicFolder = useCallback(async ({ id }) => {
     try {
-      const children = await restProvider.loadFiles(id);
+      let children;
+      if (settings.activeMount === "google") {
+        const folder = managerRef.current?.getFile(id);
+        const response = await fetch("/api/google-drive/filemanager", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            driveId: folder?.driveId,
+            parentPath: id,
+            googleDrive: settings.googleDrive,
+          }),
+        });
+        children = await readJsonResponse(response);
+        if (!response.ok) throw new Error(children.error || "Unable to load Google Drive folder");
+        children = children.map((item) => ({ ...item, date: item.date ? new Date(item.date) : new Date() }));
+      } else {
+        children = await restProvider.loadFiles(id);
+      }
       if (!Array.isArray(children)) throw new Error("Unable to load folder contents");
       await managerRef.current?.exec("provide-data", { id, data: children });
     } catch (error) {
       setSyncNotice({ type: "error", text: error.message });
     }
+  }, [settings.activeMount, settings.googleDrive]);
+
+  const openMuxPreview = useCallback((id, name) => {
+    setMuxVideo({ fileId: id, name, status: "self_hosted" });
   }, []);
 
   const initializeFilemanager = useCallback((managerApi) => {
@@ -162,6 +256,11 @@ export default function App() {
     );
 
     managerApi.on("open-file", ({ id }) => {
+      const file = managerApi.getFile(id);
+      if (file?.type === "file" && videoExtensions.has(file.ext)) {
+        openMuxPreview(id, file.name);
+        return;
+      }
       const opened = window.open(getDirectLink(id), "_blank", "noopener,noreferrer");
       if (!opened) setSyncNotice({ type: "error", text: "Allow pop-ups to open this file." });
     });
@@ -184,22 +283,62 @@ export default function App() {
       });
     }, { tag: providerListenerTag });
     managerApi.setNext(restProvider);
-  }, []);
+  }, [openMuxPreview]);
 
   useEffect(() => {
     let cancelled = false;
     fetch("/api/nas/settings")
-      .then((response) => response.json())
+      .then(readJsonResponse)
       .then(async (saved) => {
         if (cancelled) return;
-        setSettings(saved);
-        if (saved.path) await loadNasFiles();
+        setSettings((current) => ({
+          ...current,
+          ...saved,
+          googleDrive: { ...current.googleDrive, ...(saved.googleDrive || {}) },
+        }));
+        if (saved.activeMount === "google" && saved.googleDrive?.folderId) await loadGoogleMount(saved);
+        else if (saved.path) await loadNasFiles();
       })
       .catch(() => {
         if (!cancelled) setConnected(false);
       });
     return () => { cancelled = true; };
-  }, [loadNasFiles]);
+  }, [loadGoogleMount, loadNasFiles]);
+
+  useEffect(() => {
+    if (googleOAuthHandledRef.current) return;
+    const query = new URLSearchParams(window.location.search);
+    const code = query.get("code");
+    const state = query.get("state");
+    const oauthError = query.get("error");
+    if (!code && !oauthError) return;
+    googleOAuthHandledRef.current = true;
+    window.history.replaceState({}, "", `${window.location.pathname}${window.location.hash}`);
+    setSettingsOpen(true);
+    setSettingsTab("google");
+    if (oauthError) {
+      setGoogleTestResult({ type: "error", text: query.get("error_description") || oauthError });
+      return;
+    }
+    setGoogleAuthBusy(true);
+    fetch("/api/google-drive/oauth-callback", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ code, state }),
+    })
+      .then(async (response) => {
+        const result = await readJsonResponse(response);
+        if (!response.ok) throw new Error(result.error || "Unable to complete Google authorization");
+        setSettings((current) => ({
+          ...current,
+          ...result.settings,
+          googleDrive: { ...current.googleDrive, ...result.settings.googleDrive },
+        }));
+        setGoogleTestResult({ type: "success", text: "Google Drive authorized. Refresh token saved automatically." });
+      })
+      .catch((error) => setGoogleTestResult({ type: "error", text: error.message }))
+      .finally(() => setGoogleAuthBusy(false));
+  }, []);
 
   const menuOptions = useCallback((context, item) => {
     const options = getMenuOptions(context);
@@ -215,11 +354,37 @@ export default function App() {
     return options;
   }, []);
 
+  const loadExtraInfo = useCallback(async (file) => {
+    try {
+      const response = await fetch(`/api/nas/item-info?id=${encodeURIComponent(file.id)}`);
+      if (!response.ok) return null;
+      return await readJsonResponse(response);
+    } catch {
+      return null;
+    }
+  }, []);
+
   const captureSelection = useCallback(() => {
     queueMicrotask(() => {
       const state = managerRef.current?.getState();
       const panel = state?.panels?.[state.activePanel];
-      setSelection(panel?.selected ? [...panel.selected] : []);
+      const selected = panel?.selected ? [...panel.selected] : [];
+      setSelection(selected);
+      if (selected.length === 1) {
+        const file = managerRef.current?.getFile(selected[0]);
+        if (file?.type === "file" && videoExtensions.has(file.ext)) {
+          setSelectedVideo({
+            fileId: file.id,
+            name: file.name,
+            ext: file.ext,
+            size: file.size,
+            date: file.date,
+            status: "self_hosted",
+          });
+          return;
+        }
+      }
+      setSelectedVideo(null);
     });
   }, []);
 
@@ -243,6 +408,13 @@ export default function App() {
     const items = managerRef.current?.serialize("/") || [];
     items.filter((item) => item.type === "folder").forEach((item) => {
       managerRef.current?.exec("open-tree-folder", { id: item.id, mode: false });
+    });
+  }
+
+  function expandLoadedFolders() {
+    const items = managerRef.current?.serialize("/") || [];
+    items.filter((item) => item.type === "folder" && !item.lazy).forEach((item) => {
+      managerRef.current?.exec("open-tree-folder", { id: item.id, mode: true });
     });
   }
 
@@ -271,6 +443,11 @@ export default function App() {
     const item = selection.length === 1 ? managerRef.current?.getFile(selection[0]) : null;
     if (!item || item.type !== "file") return "";
     return `${window.location.origin}/api/nas/direct?id=${encodeURIComponent(item.id)}`;
+  }
+
+  function selectedVideoItem() {
+    const item = selection.length === 1 ? managerRef.current?.getFile(selection[0]) : null;
+    return item?.type === "file" && videoExtensions.has(item.ext) ? item : null;
   }
 
   async function copySelectedLink() {
@@ -315,7 +492,7 @@ export default function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ ids: selection, ...labelForm }),
       });
-      const result = await response.json();
+      const result = await readJsonResponse(response);
       if (!response.ok) throw new Error(result.error || "Unable to apply label");
       await loadNasFiles();
       setLabelDialogOpen(false);
@@ -339,11 +516,14 @@ export default function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(settings),
       });
-      const result = await response.json();
+      const result = await readJsonResponse(response);
       if (!response.ok) throw new Error(result.error || "Unable to save NAS settings");
       setSettings(result.settings);
-      setData(result.files.map((item) => ({ ...item, date: new Date(item.date) })));
-      setDrive(result.drive || drive);
+      if (result.settings.activeMount === "google") await loadGoogleMount(result.settings);
+      else {
+        setData(result.files.map((item) => ({ ...item, date: new Date(item.date) })));
+        setDrive(result.drive || drive);
+      }
       setConnected(true);
       setSettingsOpen(false);
       setActivePanel(0);
@@ -361,7 +541,7 @@ export default function App() {
     try {
       const query = folderPath ? `?path=${encodeURIComponent(folderPath)}` : "";
       const response = await fetch(`/api/nas/directories${query}`);
-      const result = await response.json();
+      const result = await readJsonResponse(response);
       if (!response.ok) throw new Error(result.error || "Unable to browse this location");
       setFolderBrowser(result);
     } catch (error) {
@@ -400,6 +580,88 @@ export default function App() {
     setSettings({ ...settings, clients: settings.clients.filter((_, clientIndex) => clientIndex !== index) });
   }
 
+  function updateGoogleDrive(field, value) {
+    setSettings({
+      ...settings,
+      googleDrive: { ...settings.googleDrive, [field]: value },
+    });
+    setGoogleTestResult(null);
+  }
+
+  async function testGoogleDriveConnection() {
+    setGoogleTestBusy(true);
+    setGoogleTestResult(null);
+    try {
+      const response = await fetch("/api/google-drive/test", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ googleDrive: settings.googleDrive }),
+      });
+      const result = await readJsonResponse(response);
+      if (!response.ok) throw new Error(result.error || "Unable to connect to Google Drive");
+      setGoogleTestResult({ type: "success", text: result.target?.name
+        ? `Connected to “${result.target.name}”`
+        : `Google Drive connected${result.user ? ` as ${result.user}` : ""}` });
+    } catch (error) {
+      setGoogleTestResult({ type: "error", text: error.message });
+    } finally {
+      setGoogleTestBusy(false);
+    }
+  }
+
+  async function authorizeGoogleDrive() {
+    setGoogleAuthBusy(true);
+    setGoogleTestResult(null);
+    try {
+      const response = await fetch("/api/google-drive/auth-url", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ googleDrive: settings.googleDrive }),
+      });
+      const result = await readJsonResponse(response);
+      if (!response.ok) throw new Error(result.error || "Unable to start Google authorization");
+      window.location.assign(result.authUrl);
+    } catch (error) {
+      setGoogleTestResult({ type: "error", text: error.message });
+      setGoogleAuthBusy(false);
+    }
+  }
+
+  async function browseGoogleFolder(parentId = "root") {
+    setGoogleFolderBusy(true);
+    setGoogleFolderError("");
+    try {
+      const response = await fetch("/api/google-drive/folders", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ parentId, googleDrive: settings.googleDrive }),
+      });
+      const result = await readJsonResponse(response);
+      if (!response.ok) throw new Error(result.error || "Unable to browse Google Drive folders");
+      setGoogleFolderBrowser(result);
+    } catch (error) {
+      setGoogleFolderError(error.message);
+      if (!googleFolderBrowser) setGoogleFolderBrowser({ current: { id: parentId, name: "Google Drive", parentId: null }, folders: [] });
+    } finally {
+      setGoogleFolderBusy(false);
+    }
+  }
+
+  function openGoogleFolderBrowser() {
+    setGoogleFolderBrowser({ current: { id: "root", name: "My Drive", parentId: null }, folders: [] });
+    browseGoogleFolder("root");
+  }
+
+  function selectGoogleFolder() {
+    const folder = googleFolderBrowser.current;
+    setSettings({
+      ...settings,
+      googleDrive: { ...settings.googleDrive, folderId: folder.id, folderName: folder.name },
+    });
+    setGoogleFolderBrowser(null);
+    setGoogleTestResult({ type: "success", text: `Selected Google Drive folder “${folder.name}”` });
+  }
+
   function openProjectDialog() {
     if (!connected) {
       setSettingsError("Connect a NAS folder before creating a project.");
@@ -424,10 +686,13 @@ export default function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(project),
       });
-      const result = await response.json();
+      const result = await readJsonResponse(response);
       if (!response.ok) throw new Error(result.error || "Unable to create project folders");
-      setData(result.files.map((item) => ({ ...item, date: new Date(item.date) })));
-      if (result.drive) setDrive(result.drive);
+      if (result.mount === "google") await loadGoogleMount(settings);
+      else {
+        setData(result.files.map((item) => ({ ...item, date: new Date(item.date) })));
+        if (result.drive) setDrive(result.drive);
+      }
       setProjectCreated(result.createdPath);
       setProject({ ...project, eventName: "" });
     } catch (error) {
@@ -447,7 +712,7 @@ export default function App() {
         <div className="header-actions">
           {settings.readonly && <span className="readonly-badge">Read only</span>}
           <span className={`status ${connected ? "connected" : "demo"}`}>
-            {connected ? "NAS connected" : "Template data"}
+            {connected ? settings.activeMount === "google" ? "Google Drive mounted" : "Local/NAS mounted" : "Template data"}
           </span>
           <button className="admin-button" type="button" onClick={() => setSettingsOpen(true)}>
             ⚙ Admin settings
@@ -511,8 +776,11 @@ export default function App() {
       </section>
 
       <nav className="action-toolbar" aria-label="File actions">
-        <button type="button" onClick={collapseAllFolders} title="Collapse every folder in the navigation pane">
-          <span>⊟</span> Collapse all
+        <button type="button" onClick={expandLoadedFolders} title="Expand all folders already loaded in the navigation tree">
+          <span>⊞</span> Expand tree
+        </button>
+        <button type="button" onClick={collapseAllFolders} title="Collapse every folder in the navigation tree">
+          <span>⊟</span> Collapse tree
         </button>
         <span className="toolbar-divider" />
         <button type="button" disabled={settings.readonly} onClick={() => uploadInputRef.current?.click()}>
@@ -523,6 +791,16 @@ export default function App() {
         </button>
         <button type="button" disabled={!selectedDirectLink()} onClick={copySelectedLink}>
           <span>🔗</span> Get link
+        </button>
+        <button
+          type="button"
+          disabled={!selectedVideoItem()}
+          onClick={() => {
+            const video = selectedVideoItem();
+            if (video) openMuxPreview(video.id, video.name);
+          }}
+        >
+          <span>▶</span> Video preview
         </button>
         <button type="button" disabled={settings.readonly || !selection.length} onClick={() => setLabelDialogOpen(true)}>
           <span>●</span> Labels
@@ -542,11 +820,13 @@ export default function App() {
             ref={managerRef}
             data={data}
             drive={drive}
-            readonly={settings.readonly}
+            readonly={settings.readonly || settings.activeMount === "google"}
             mode={mode}
             panels={panels}
             activePanel={activePanel}
             preview
+            previews={filePreview}
+            extraInfo={loadExtraInfo}
             menuOptions={menuOptions}
             icons={iconStyle === "simple" ? "simple" : customIcons}
             init={initializeFilemanager}
@@ -559,6 +839,53 @@ export default function App() {
           <Tooltip api={api} content={FileTooltip} at="bottom" />
           </Theme>;
         })()}
+        {selectedVideo && (
+          <aside className="video-pane-preview" aria-label={`Video preview for ${selectedVideo.name}`}>
+            <div className="video-thumbnail">
+              <video
+                className="video-thumbnail-media"
+                src={`/api/nas/direct?id=${encodeURIComponent(selectedVideo.fileId)}`}
+                preload="metadata"
+                muted
+                playsInline
+                onLoadedMetadata={(event) => {
+                  const media = event.currentTarget;
+                  setSelectedVideo((current) => current?.fileId === selectedVideo.fileId ? {
+                    ...current,
+                    duration: Number.isFinite(media.duration) ? media.duration : current.duration,
+                    aspectRatio: media.videoWidth && media.videoHeight
+                      ? `${media.videoWidth} × ${media.videoHeight}`
+                      : current.aspectRatio,
+                  } : current);
+                  if (media.duration > 0.2) media.currentTime = 0.1;
+                }}
+              />
+              <div className="video-thumbnail-play" aria-hidden="true"><span>▶</span></div>
+              <span className="video-duration">{formatDuration(selectedVideo.duration)}</span>
+            </div>
+            <div className="video-pane-heading">
+              <h2>{selectedVideo.name}</h2>
+              <span className={`mux-status ${selectedVideo.status}`}>{selectedVideo.status?.replaceAll("_", " ")}</span>
+            </div>
+            <dl className="video-pane-metadata">
+              <div><dt>Format</dt><dd>{selectedVideo.ext?.toUpperCase() || "Video"}</dd></div>
+              <div><dt>Size</dt><dd>{formatBytes(selectedVideo.size)}</dd></div>
+              <div><dt>Duration</dt><dd>{formatDuration(selectedVideo.duration)}</dd></div>
+              <div><dt>Resolution</dt><dd>{selectedVideo.aspectRatio || "—"}</dd></div>
+              <div><dt>Modified</dt><dd>{selectedVideo.date ? new Date(selectedVideo.date).toLocaleString() : "—"}</dd></div>
+              <div><dt>File ID</dt><dd title={selectedVideo.fileId}>{selectedVideo.fileId}</dd></div>
+              <div><dt>Source</dt><dd>NAS direct stream</dd></div>
+            </dl>
+            <button
+              className="video-play-button"
+              type="button"
+              onClick={() => openMuxPreview(selectedVideo.fileId, selectedVideo.name)}
+            >
+              <span aria-hidden="true">▶</span>
+              Play video
+            </button>
+          </aside>
+        )}
       </section>
 
       {syncNotice && (
@@ -598,6 +925,55 @@ export default function App() {
         </div>
       )}
 
+      {muxVideo && (
+        <div className="export-backdrop mux-backdrop" role="presentation" onMouseDown={() => setMuxVideo(null)}>
+          <section className="mux-dialog" role="dialog" aria-modal="true" aria-labelledby="mux-title" onMouseDown={(event) => event.stopPropagation()}>
+            <div className="export-heading">
+              <div>
+                <p className="eyebrow">Self-hosted video playback</p>
+                <h2 id="mux-title">{muxVideo.name}</h2>
+              </div>
+              <button type="button" aria-label="Close" onClick={() => setMuxVideo(null)}>×</button>
+            </div>
+
+            <Suspense fallback={<div className="mux-state"><div className="mux-spinner" /><p>Loading video player…</p></div>}>
+              <MuxPlayer
+                className="mux-player"
+                src={`/api/nas/direct?id=${encodeURIComponent(muxVideo.fileId)}`}
+                streamType="on-demand"
+                preload="metadata"
+                autoPlay
+                playsInline
+                disableTracking
+                disableCookies
+                proudlyDisplayMuxBadge={false}
+                metadata={{
+                  video_id: muxVideo.fileId,
+                  video_title: muxVideo.name,
+                }}
+                accentColor="#2563eb"
+                onLoadedMetadata={(event) => {
+                  const player = event.currentTarget;
+                  const duration = Number(player.duration);
+                  const width = Number(player.videoWidth || player.media?.videoWidth);
+                  const height = Number(player.videoHeight || player.media?.videoHeight);
+                  setSelectedVideo((current) => current?.fileId === muxVideo.fileId ? {
+                    ...current,
+                    duration: Number.isFinite(duration) ? duration : current.duration,
+                    aspectRatio: width && height ? `${width} × ${height}` : current.aspectRatio,
+                  } : current);
+                }}
+              />
+            </Suspense>
+
+            <div className="mux-footer">
+              <span>Source: NAS direct byte-range stream</span>
+              <span>No Mux upload or playback server required</span>
+            </div>
+          </section>
+        </div>
+      )}
+
       {serialized && (
         <div className="export-backdrop" role="presentation" onMouseDown={() => setSerialized(null)}>
           <section
@@ -631,17 +1007,35 @@ export default function App() {
             <div className="export-heading">
               <div>
                 <p className="eyebrow">Administrator</p>
-                <h2 id="settings-title">NAS folder connection</h2>
+                <h2 id="settings-title">Admin settings</h2>
               </div>
               <button type="button" aria-label="Close" onClick={() => setSettingsOpen(false)}>×</button>
             </div>
 
+            <div className="settings-tabs" role="tablist" aria-label="Admin settings sections">
+              <button type="button" role="tab" aria-selected={settingsTab === "nas"} className={settingsTab === "nas" ? "active" : ""} onClick={() => setSettingsTab("nas")}>NAS & Clients</button>
+              <button type="button" role="tab" aria-selected={settingsTab === "google"} className={settingsTab === "google" ? "active" : ""} onClick={() => setSettingsTab("google")}>Google Drive Sync</button>
+            </div>
+
+            {settingsTab === "nas" ? <>
             <p className="settings-intro">
-              Enter the path where the NAS share is mounted on this server. DAMXPLOR will browse beneath this folder only.
+              Choose which connected storage appears in the File Manager navigation pane.
             </p>
 
+            <fieldset className="mount-source-picker">
+              <legend>Active mount</legend>
+              <label className={settings.activeMount === "nas" ? "active" : ""}>
+                <input type="radio" name="activeMount" value="nas" checked={settings.activeMount === "nas"} onChange={() => setSettings({ ...settings, activeMount: "nas" })} />
+                <span><strong>Local Drive / NAS</strong><small>{settings.path || "No local folder selected"}</small></span>
+              </label>
+              <label className={settings.activeMount === "google" ? "active" : ""}>
+                <input type="radio" name="activeMount" value="google" checked={settings.activeMount === "google"} disabled={!settings.googleDrive?.folderId} onChange={() => setSettings({ ...settings, activeMount: "google" })} />
+                <span><strong>Google Drive</strong><small>{settings.googleDrive?.folderName || "Choose a mounted Drive folder below"}</small></span>
+              </label>
+            </fieldset>
+
             <label className="settings-field">
-              <span>Mounted folder path</span>
+              <span>Mounted local folder path</span>
               <div className="path-input-group">
                 <input
                   required
@@ -653,6 +1047,15 @@ export default function App() {
                 <button type="button" onClick={openFolderBrowser}>Browse…</button>
               </div>
               <small>Examples: /Volumes/NAS, /mnt/company-nas, or a mounted SMB share.</small>
+            </label>
+
+            <label className="settings-field google-mount-field">
+              <span>Mounted Google Drive folder</span>
+              <div className="path-input-group">
+                <input value={settings.googleDrive?.folderId || ""} onChange={(event) => updateGoogleDrive("folderId", event.target.value)} placeholder="Authorize Google Drive, then choose a folder" />
+                <button type="button" onClick={openGoogleFolderBrowser} disabled={!settings.googleDrive?.hasRefreshToken && !settings.googleDrive?.refreshToken}>Browse…</button>
+              </div>
+              <small>{settings.googleDrive?.folderName ? `Selected: ${settings.googleDrive.folderName}` : "This Drive folder becomes the root of the Google navigation tree."}</small>
             </label>
 
             <div className="settings-row">
@@ -740,13 +1143,36 @@ export default function App() {
                 {!settings.clients?.length && <p className="empty-clients">No clients yet. Add one to create projects.</p>}
               </div>
             </section>
+            </> : <section className="google-drive-settings" role="tabpanel">
+              <p className="settings-intro">Connect a Google Drive OAuth application and choose the Drive or Shared Drive folder associated with this NAS workspace.</p>
+              <label className="checkbox-field readonly-setting">
+                <input type="checkbox" checked={settings.googleDrive?.enabled || false} onChange={(event) => updateGoogleDrive("enabled", event.target.checked)} />
+                <span><strong>Enable Google Drive sync</strong><small>Saved secrets are retained server-side and omitted from settings API responses.</small></span>
+              </label>
+              <div className="google-credentials-grid">
+                <label className="settings-field"><span>OAuth Client ID</span><input value={settings.googleDrive?.clientId || ""} onChange={(event) => updateGoogleDrive("clientId", event.target.value)} autoComplete="off" /></label>
+                <label className="settings-field"><span>OAuth Client Secret</span><input type="password" value={settings.googleDrive?.clientSecret || ""} onChange={(event) => updateGoogleDrive("clientSecret", event.target.value)} placeholder={settings.googleDrive?.hasClientSecret ? "Configured — enter to replace" : "Required"} autoComplete="new-password" /></label>
+                <label className="settings-field wide"><span>Refresh Token</span><input type="password" value={settings.googleDrive?.refreshToken || ""} onChange={(event) => updateGoogleDrive("refreshToken", event.target.value)} placeholder={settings.googleDrive?.hasRefreshToken ? "Configured — enter to replace" : "Required"} autoComplete="new-password" /></label>
+                <label className="settings-field wide"><span>Drive API base URL</span><input type="url" value={settings.googleDrive?.apiBaseUrl || ""} onChange={(event) => updateGoogleDrive("apiBaseUrl", event.target.value)} /></label>
+                <label className="settings-field wide"><span>OAuth token URL</span><input type="url" value={settings.googleDrive?.tokenUrl || ""} onChange={(event) => updateGoogleDrive("tokenUrl", event.target.value)} /></label>
+                <label className="settings-field wide"><span>Authorized redirect URI</span><input type="url" value={settings.googleDrive?.redirectUri || ""} onChange={(event) => updateGoogleDrive("redirectUri", event.target.value)} /><small>This must exactly match a URI registered in Google Cloud Console, including hostname and port.</small></label>
+                <label className="settings-field"><span>Sync direction</span><select value={settings.googleDrive?.direction || "drive-to-nas"} onChange={(event) => updateGoogleDrive("direction", event.target.value)}><option value="drive-to-nas">Drive → NAS</option><option value="nas-to-drive">NAS → Drive</option><option value="two-way">Two-way</option></select></label>
+                <label className="settings-field"><span>Sync interval (minutes)</span><input type="number" min="5" max="1440" value={settings.googleDrive?.intervalMinutes || 30} onChange={(event) => updateGoogleDrive("intervalMinutes", Number(event.target.value))} /></label>
+              </div>
+              <label className="checkbox-field"><input type="checkbox" checked={settings.googleDrive?.autoSync || false} onChange={(event) => updateGoogleDrive("autoSync", event.target.checked)} />Run synchronization automatically</label>
+              <div className="google-test-row">
+                <button className="google-authorize" type="button" onClick={authorizeGoogleDrive} disabled={googleAuthBusy}>{googleAuthBusy ? "Authorizing…" : settings.googleDrive?.hasRefreshToken ? "Authorize again" : "Authorize Google Drive"}</button>
+                <button type="button" onClick={testGoogleDriveConnection} disabled={googleTestBusy || googleAuthBusy}>{googleTestBusy ? "Testing…" : "Test connection"}</button>
+                {googleTestResult && <span className={googleTestResult.type}>{googleTestResult.text}</span>}
+              </div>
+            </section>}
 
             {settingsError && <p className="settings-error" role="alert">{settingsError}</p>}
 
             <div className="settings-actions">
               <button type="button" onClick={() => setSettingsOpen(false)}>Cancel</button>
               <button className="save-settings" type="submit" disabled={settingsBusy}>
-                {settingsBusy ? "Testing connection…" : "Save and browse NAS"}
+                {settingsBusy ? "Saving…" : "Save settings"}
               </button>
             </div>
           </form>
@@ -805,6 +1231,33 @@ export default function App() {
         </div>
       )}
 
+      {googleFolderBrowser && (
+        <div className="folder-browser-backdrop" role="presentation" onMouseDown={() => setGoogleFolderBrowser(null)}>
+          <section className="folder-browser-dialog" role="dialog" aria-modal="true" aria-labelledby="google-folder-browser-title" onMouseDown={(event) => event.stopPropagation()}>
+            <div className="export-heading">
+              <div><p className="eyebrow">Connected Google Drive</p><h2 id="google-folder-browser-title">Choose mounted folder</h2></div>
+              <button type="button" aria-label="Close" onClick={() => setGoogleFolderBrowser(null)}>×</button>
+            </div>
+            <div className="folder-path" title={googleFolderBrowser.current.id}>☁ {googleFolderBrowser.current.name}</div>
+            <div className="folder-list" aria-busy={googleFolderBusy}>
+              {googleFolderBrowser.current.parentId && (
+                <button type="button" className="folder-item parent" onClick={() => browseGoogleFolder(googleFolderBrowser.current.parentId)}><span>↰</span><span>Parent folder</span><span /></button>
+              )}
+              {googleFolderBrowser.folders.map((folder) => (
+                <button type="button" className="folder-item" key={folder.id} onClick={() => browseGoogleFolder(folder.id)}><span>📁</span><span>{folder.name}</span><span>›</span></button>
+              ))}
+              {googleFolderBusy && <p className="folder-message">Loading Google Drive folders…</p>}
+              {!googleFolderBusy && !googleFolderError && !googleFolderBrowser.folders.length && <p className="folder-message">No subfolders here. You can select this folder.</p>}
+              {googleFolderError && <p className="settings-error" role="alert">{googleFolderError}</p>}
+            </div>
+            <div className="settings-actions">
+              <button type="button" onClick={() => setGoogleFolderBrowser(null)}>Cancel</button>
+              <button className="save-settings" type="button" disabled={googleFolderBusy || Boolean(googleFolderError)} onClick={selectGoogleFolder}>Mount this Drive folder</button>
+            </div>
+          </section>
+        </div>
+      )}
+
       {projectDialogOpen && (
         <div className="export-backdrop" role="presentation" onMouseDown={() => setProjectDialogOpen(false)}>
           <form
@@ -815,14 +1268,14 @@ export default function App() {
           >
             <div className="export-heading">
               <div>
-                <p className="eyebrow">NAS project template</p>
+                <p className="eyebrow">{settings.activeMount === "google" ? "Google Drive project template" : "NAS project template"}</p>
                 <h2 id="project-title">Create Project Folders</h2>
               </div>
               <button type="button" aria-label="Close" onClick={() => setProjectDialogOpen(false)}>×</button>
             </div>
 
             <p className="settings-intro">
-              Creates the complete production structure inside <strong>00 Project Archive</strong> on the connected NAS.
+              Creates the complete production structure inside <strong>00 Project Archive</strong> on the active {settings.activeMount === "google" ? "Google Drive" : "Local/NAS"} mount.
             </p>
 
             <div className="project-fields">

@@ -6,6 +6,12 @@
       "sourceType": "github",
       "skillPath": "svar-react/SKILL.md",
       "computedHash": "f5386157b42928b2833ee1d3d3e3c2aa50b00fdf4928c64534a7957a6a979421"
+    },
+    "webapp-testing": {
+      "source": "anthropics/skills",
+      "sourceType": "github",
+      "skillPath": "skills/webapp-testing/SKILL.md",
+      "computedHash": "ad5b1fc52807e9afa4635e59218a026b164dc58b6c3f41b0f7c644dcd6ccf572"
     }
   }
 }

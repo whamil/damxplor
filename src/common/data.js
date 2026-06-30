@@ -39,5 +39,6 @@ export function getData() {
     id,
     type: "folder",
     date: created,
+    open: false,
   }));
 }
