@@ -278,6 +278,36 @@ async function loadGoogleFilemanager(input) {
   });
 }
 
+async function trashGoogleDriveFiles(input) {
+  const settings = await validateSettings(await getSettings());
+  if (settings.readonly) throw new Error("NAS is in read-only mode");
+  const google = { ...settings.googleDrive, ...(input.googleDrive || {}) };
+  const driveIds = [...new Set((input.driveIds || []).map((id) => String(id || "").trim()).filter(Boolean))];
+  if (!driveIds.length) throw new Error("Select at least one Google Drive item");
+  if (driveIds.includes(google.folderId)) throw new Error("The mounted Google Drive folder cannot be deleted");
+
+  const { accessToken } = await googleDriveAccess({ googleDrive: google });
+  const apiBase = String(google.apiBaseUrl || defaultSettings.googleDrive.apiBaseUrl).replace(/\/$/, "");
+  for (const driveId of driveIds) {
+    const response = await fetch(
+      `${apiBase}/files/${encodeURIComponent(driveId)}?supportsAllDrives=true`,
+      {
+        method: "PATCH",
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ trashed: true }),
+      },
+    );
+    if (!response.ok) {
+      const result = await response.json().catch(() => ({}));
+      throw new Error(result.error?.message || "Unable to move a Google Drive item to trash");
+    }
+  }
+  return { driveIds };
+}
+
 function requestOrigin(request) {
   const forwardedProto = String(request.headers["x-forwarded-proto"] || "").split(",")[0].trim();
   const protocol = forwardedProto || (request.socket?.encrypted ? "https" : "http");
@@ -1196,6 +1226,10 @@ export async function handleNasApi(request, response) {
 
     if (request.method === "POST" && url.pathname === "/api/google-drive/filemanager") {
       return json(response, 200, await loadGoogleFilemanager(await readBody(request)));
+    }
+
+    if (request.method === "DELETE" && url.pathname === "/api/google-drive/files") {
+      return json(response, 200, await trashGoogleDriveFiles(await readBody(request)));
     }
 
     if (request.method === "GET" && url.pathname === "/api/nas/files") {

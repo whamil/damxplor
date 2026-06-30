@@ -478,9 +478,33 @@ export default function App() {
   }
 
   async function deleteSelectedItems() {
-    if (!selection.length || !window.confirm(`Delete ${selection.length} selected item${selection.length > 1 ? "s" : ""}?`)) return;
-    await managerRef.current?.exec("delete-files", { ids: selection });
-    setSelection([]);
+    if (!selection.length) return;
+    const googleMounted = settings.activeMount === "google";
+    const destination = googleMounted ? "Move" : "Delete";
+    const suffix = googleMounted ? " to Google Drive trash" : "";
+    if (!window.confirm(`${destination} ${selection.length} selected item${selection.length > 1 ? "s" : ""}${suffix}?`)) return;
+    try {
+      if (googleMounted) {
+        const items = selection.map((id) => managerRef.current?.getFile(id));
+        const driveIds = items.map((item) => item?.driveId).filter(Boolean);
+        if (driveIds.length !== selection.length) throw new Error("One or more selected Drive items could not be identified");
+        const response = await fetch("/api/google-drive/files", {
+          method: "DELETE",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ driveIds, googleDrive: settings.googleDrive }),
+        });
+        const result = await readJsonResponse(response);
+        if (!response.ok) throw new Error(result.error || "Unable to delete Google Drive items");
+        await loadGoogleMount(settings);
+      } else {
+        await managerRef.current?.exec("delete-files", { ids: selection });
+      }
+      setSelection([]);
+      setSyncNotice({ type: "success", text: googleMounted ? "Moved to Google Drive trash" : "Items deleted" });
+      window.setTimeout(() => setSyncNotice(null), 1800);
+    } catch (error) {
+      setSyncNotice({ type: "error", text: error.message });
+    }
   }
 
   async function applySelectedLabel(event) {
